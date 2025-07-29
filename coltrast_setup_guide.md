@@ -90,15 +90,79 @@ This demonstrates:
 - Uses sentence similarity to maintain context
 - Optimizes chunk size for embedding model input limits
 
+
+Each README is segmented into semantic chunks using sentence embeddings:
+
+Embeddings are created with SentenceTransformer (e.g. "all-MiniLM-L6-v2").
+
+Sentences are merged into chunks as long as their cosine similarity stays above a threshold (0.7).
+For each Q&A pair:
+
+- Positive pair: A chunk from the same project most relevant to the Q&A (found via keyword overlap).
+- Negative pairs: Chunks from other projects considered irrelevant.
+
 ### 2. ColTrast Training
 - **Contrastive Learning:** Learns to distinguish between relevant and irrelevant content
 - **Late Interaction:** Fine-grained token-level comparison for better semantic matching
 - **Combined Loss:** Balances both approaches for optimal performance
 
+In the ColTrast model, the training goal is to bring a question closer to its correct answer chunk in embedding space and push it away from unrelated chunks.
+
+**Contrastive Loss (Global similarity)**
+
+It uses the pooled embedding (vector summary of the full question/chunk).
+
+Think of it as asking:
+"Are these two texts globally similar?"
+
+| Question                  | Chunk                               | Label |
+| ------------------------- | ----------------------------------- | ----- |
+| "What is the model used?" | "We use a transformer-based model"  | ✅ +1  |
+| "What is the model used?" | "The dataset was collected in 2022" | ❌ 0   |
+
+
+→ You take their pooled embeddings and use cosine similarity, then apply cross-entropy loss to encourage positives to be close and negatives to be far.
+
+**Late Interaction Loss (Token-level match)**
+
+Inspired by ColBERT: Instead of looking at the sentence as a whole, it compares each token in the question to each token in the chunk.
+
+It asks:
+"Does the question have token-level alignment with the chunk?"
+
+How it works:
+
+- Compute similarity between each question token and all chunk tokens.
+- Keep the max similarity for each question token.
+- Sum them → get a final similarity score.
+- Use binary cross-entropy loss:
+  - Positive pairs → score should be high
+  - Negative pairs → score should be low
+
+
+Contrastive loss helps learn general semantic similarity between question/chunk pairs.
+
+Late interaction loss helps match fine-grained details—like specific words or technical terms.
+
+
 ### 3. Fast Retrieval
 - FAISS indexing for efficient similarity search
 - Normalized embeddings for cosine similarity
 - Batch processing for large-scale inference
+
+Normalization:
+
+| Without normalization                                           | With normalization (unit vectors)                       |
+| --------------------------------------------------------------- | ------------------------------------------------------- |
+| Vectors may have large variance in scale → affects dot products | Cosine similarity becomes stable and bounded (−1 to +1) |
+| Embedding similarity may be biased by magnitude                 | Focus is on **direction**, not length                   |
+
+
+| Location              | Type of normalization   | Why?                                        |
+| --------------------- | ----------------------- | ------------------------------------------- |
+| After projection head | L2 (sentence embedding) | Contrastive loss uses cosine similarity     |
+| On token embeddings   | L2 (per token)          | Late interaction similarity (ColBERT-style) |
+
 
 ## Example Queries
 
@@ -250,3 +314,90 @@ For production deployment:
    - Add monitoring and logging
 
 This system provides a solid foundation for building AI project knowledge retrieval systems similar to the approach described in the HiPerRAG paper, adapted for your specific use case.
+
+## Clarification: 
+
+**1. Relationship between readme and q&a**
+
+⚠️ Problem:
+At first there is a problem in best chunk selection and negative pair creation: 
+
+The system tries to find a chunk in the README that "matches" the Q&A pair using simple keyword overlap (not semantic search).
+
+If it can’t find a good match, it just returns the first chunk as a fallback (see _find_best_chunk() in ColTrastDataset).
+
+If the README doesn’t mention the answer at all, the positive pair might be misleading (question paired with unrelated chunk).
+
+✅FIX: 
+
+🔹 For Positive Chunks:
+You now check semantic similarity between the Q+A and README chunks.
+
+If no good match is found (e.g., similarity < 0.6), you use the answer text itself as the chunk.
+
+✅ This guarantees that:
+
+If README is relevant, it's used.
+
+If README is irrelevant, we avoid misleading the model and use a Q&A-only pair.
+
+🔹 For Negative Chunks:
+Instead of using random chunks from other projects, you now:
+
+Compute semantic similarity to the Q+A
+
+Pick the most similar (but wrong) chunks as hard negatives
+
+✅ This forces the model to:
+
+Distinguish true relevance from close but misleading content.
+
+Avoid learning from "too easy" or unrelated negatives.
+
+After the fix, the training loss is better: 
+
+![image](training_loss/trainingloss_comparison.png)
+
+Left plot (before fix): 
+
+- Validation loss steadily decreases, but the gap between train/val remains.
+- Signs of underfitting or low-quality contrast in examples.
+
+Right plot (after fix):
+
+- Train loss drops faster and lower.
+- Validation loss follows closely at first, then diverges slightly near the end. (model might start overfitting)
+
+🔹Early stopping or regularization after epoch 7 to avoid overfitting.
+
+
+**2. Are embeddings computed twice for the whole dataset?**
+
+| Stage                           | What is embedded                    | Why                                              |
+| ------------------------------- | ----------------------------------- | ------------------------------------------------ |
+| 🔹 Chunking (semantic grouping) | Sentence-level embeddings           | To decide where to split the README into chunks  |
+| 🔹 Training                     | Token-level embeddings from encoder | To compute loss (contrastive + late interaction) |
+
+
+- Chunking stage uses a fast SentenceTransformer (MiniLM) to create embeddings for similarity-based chunking.
+- Training stage uses a full encoder with a projection head to learn task-specific embeddings.
+
+They serve different roles and are not redundant.
+
+
+**3. Where do we store embeddings for inference?**
+
+in inference_script.py → index_documents():
+
+    [self.chunk_embeddings = self.encode_batch(chunk_texts)
+    
+    # Add to FAISS index
+    self.faiss_index.add(...)
+    self.chunks = chunk_metadata  # Store associated metadata]()
+
+If you want to persist them:
+
+    save_index(path)  # saves .faiss + .pkl
+
+That way, you don’t need to re-encode the dataset every time you load the model.
+
